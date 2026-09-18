@@ -54,6 +54,15 @@ Run B (CP=True): predecessor at period-2 first = SOC @ period-2 LAST snapshot (w
 
 IMPORTANT: state_of_charge_initial is in MWh (absolute energy), NOT a fraction
 of p_nom_opt (which is power capacity in MW).
+
+NOTE on warnings and PyPSA version
+------------------------------------
+The `has_initial` / `period_conflict` / `cp_overrides_c` warning blocks
+described in the question exist in the pinned master commit (cfaab2f) but were
+introduced after PyPSA 1.3.0. The installed version (1.3.0) does not emit
+those specific cycling warnings. The constraint structure — boundary equations,
+SOC trajectories, RHS values — is identical between 1.3.0 and master for this
+experiment. The warning behaviour is documented against master commit cfaab2f.
 """
 
 from __future__ import annotations
@@ -123,6 +132,12 @@ def build_network(
     n.investment_period_weightings["objective"] = 1.0
 
     sns = n.snapshots
+
+    # Register carriers explicitly to suppress PyPSA 1.3.0 carrier-undefined
+    # warnings, which would otherwise obscure the cycling-related warnings
+    for carrier in ("AC", "solar", "gas", "battery"):
+        if carrier not in n.carriers.index:
+            n.add("Carrier", carrier)
 
     n.add("Bus", "grid", carrier="AC")
 
