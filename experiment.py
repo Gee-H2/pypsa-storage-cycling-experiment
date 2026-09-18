@@ -1,25 +1,57 @@
 """
 PyPSA StorageUnit CP vs C cycling experiment
 =============================================
-Commit pinned: cfaab2fd723d14fd6ad3594bdca8c0c1c9d4a14d
-File:          pypsa/optimization/constraints.py
+PyPSA version:  1.3.0
+xarray version: 2025.1.2  (required — later versions have a MultiIndex incompatibility)
+linopy version: 0.9.1
+Commit pinned:  cfaab2fd723d14fd6ad3594bdca8c0c1c9d4a14d
+File:           pypsa/optimization/constraints.py
 
-Two fully specified runs:
-  Run A — global cycling only  (C=True,  CP=False, IP=False)
-  Run B — per-period cycling   (C=False, CP=True,  IP=True,  soc_initial=50.0 MWh)
+Two fully specified runs — identical in every parameter except the cycling flags:
 
-Both runs use identical networks, costs, profiles, and solver settings.
-The only difference is the three StorageUnit cycling flags.
+  Run A — global cycling only   (C=True,  CP=False, IP=False)
+  Run B — per-period cycling    (C=False, CP=True,  IP=True,
+                                  state_of_charge_initial=50.0 MWh)
 
-Outputs recorded for each run
-------------------------------
-- logger warnings emitted during optimisation
-- Energy-balance equation at the period boundary (last snapshot of period 1
-  and first snapshot of period 2)
-- Full SOC trajectory (MWh)
-- Optimised storage capacity p_nom_opt (MW) and e_nom_opt (MWh)
-- Optimised generator capacities (MW)
-- Total system cost (objective value, £)
+Network: two investment periods (2025, 2030), 48 hourly snapshots per period
+(two representative days), extendable solar + gas + battery.
+
+Period 1 (2025): high solar CF (1.2 daytime) — charging surplus.
+Period 2 (2030): low solar CF (0.3 daytime) — deficit, needs storage or gas.
+
+What the experiment records
+---------------------------
+For each run:
+  - All logger.WARNING messages emitted during optimisation
+  - SOC (MWh) at the last snapshot of period 1 and first snapshot of period 2
+  - Full SOC trajectory across all 96 snapshots
+  - Optimised battery p_nom_opt (MW) and e_nom_opt (MWh)
+  - Optimised solar and gas capacities (MW)
+  - Total system cost (objective)
+
+Key mechanism under study
+--------------------------
+In define_storage_unit_constraints (constraints.py), the mask:
+
+    include_previous_soc_pp = active & (within_period | cyclic_state_of_charge_per_period)
+
+determines which SOC predecessor enters the energy-balance constraint at each snapshot.
+
+When CP=True, this mask is True at period-boundary snapshots. The predecessor
+injected is from roll_within_periods(soc) — the last snapshot of the SAME period
+(within-period wrap), NOT the last snapshot of the previous period.
+
+The state_of_charge_initial injection:
+    rhs = rhs.where(include_previous_soc, rhs - soc_init)
+only fires when include_previous_soc is False. CP=True keeps it True at period
+boundaries, so soc_init (50.0 MWh — an absolute energy value, not a fraction
+of p_nom_opt) is structurally absent from those constraint rows.
+
+NOTE on state_of_charge_initial units
+--------------------------------------
+state_of_charge_initial is in MWh (absolute energy). It is NOT a fraction of
+p_nom_opt (which is power capacity in MW). These are different physical quantities.
+Setting soc_initial=50 means 50 MWh, regardless of how large the battery is built.
 """
 
 from __future__ import annotations
@@ -31,16 +63,19 @@ import numpy as np
 import pandas as pd
 import pypsa
 
-# ---------------------------------------------------------------------------
-# Logging — capture warnings emitted by PyPSA during optimisation
-# ---------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
-logger = logging.getLogger(__name__)
+# Suppress irrelevant deprecation noise from xarray/pandas during solve
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s  %(message)s")
 
 captured_warnings: dict[str, list[str]] = {"A": [], "B": []}
 
 
 class _WarningCapture(logging.Handler):
+    """Capture PyPSA logger.warning calls during optimisation."""
+
     def __init__(self, store: list[str]) -> None:
         super().__init__()
         self._store = store
@@ -61,59 +96,35 @@ def build_network(
     soc_initial_mwh: float,
 ) -> pypsa.Network:
     """
-    Build a two-investment-period network with:
-      - 2 investment periods: 2025 and 2030, each represented by 4 snapshots
-        (one per quarter, weighted to represent ~2.5 years each)
-      - 1 bus
-      - 1 extendable solar generator  (period 1: high output, period 2: low)
-      - 1 extendable gas generator    (expensive peaker, always available)
-      - 1 extendable StorageUnit      (4-hour battery)
-      - 1 fixed load
+    Build a two-investment-period network with 48 hourly snapshots per period.
 
-    All costs and efficiencies are explicit. No defaults are relied upon
-    beyond PyPSA component defaults documented in the reference version.
+    Investment periods : 2025, 2030 (each representing 5 calendar years)
+    Snapshots          : 48 hourly timestamps (two representative days)
+    Snapshot weighting : 912.5 h each  (5 yr × 8760 h/yr / 48 snapshots)
 
-    Parameters
-    ----------
-    cyclic : bool
-        cyclic_state_of_charge — global horizon cycling (C)
-    cyclic_per_period : bool
-        cyclic_state_of_charge_per_period — per-period cycling (CP)
-    soc_initial_per_period : bool
-        state_of_charge_initial_per_period — use soc_initial at period start (IP)
-    soc_initial_mwh : float
-        state_of_charge_initial in MWh (absolute energy, NOT a fraction of p_nom)
+    Solar profile — daytime hours 08:00–17:00:
+      Period 2025 : CF = 1.2  (strong surplus available for charging)
+      Period 2030 : CF = 0.3  (weak output, storage or gas needed)
+
+    Load : flat 100 MW across all snapshots and both periods.
+
+    IMPORTANT: state_of_charge_initial is in MWh (absolute energy), NOT a
+    fraction of p_nom_opt (power capacity in MW).
     """
-
-    # ------------------------------------------------------------------
-    # Snapshots: 4 quarterly snapshots per investment year
-    # Each snapshot is weighted ~21,900 hours (2.5 years / 4 quarters)
-    # ------------------------------------------------------------------
-    years = [2025, 2030]
-    quarters = pd.to_timedelta([0, 3, 6, 9], unit="ME")  # 0, 3, 6, 9 months
-
-    snapshots = pd.DatetimeIndex(
-        [pd.Timestamp(y, 1, 1) + q for y in years for q in quarters]
-    )
-    investment_periods = years
-    investment_period_weightings = pd.DataFrame(
-        {
-            "years": [5.0, 5.0],        # each period spans 5 calendar years
-            "objective": [1.0, 1.0],    # equal objective weighting
-        },
-        index=pd.Index(investment_periods, name="period"),
-    )
+    per_period_timestamps = pd.date_range("2020-01-01", periods=48, freq="h")
+    hours = per_period_timestamps.hour % 24
+    daytime = (hours >= 8) & (hours <= 17)
 
     n = pypsa.Network()
-    n.set_snapshots(
-        snapshots,
-        weightings=pd.Series(
-            [21900.0] * 8,   # hours per snapshot (5 years / 4 snapshots * 8760 h/yr)
-            index=snapshots,
-        ),
-    )
-    n.investment_periods = investment_periods
-    n.investment_period_weightings = investment_period_weightings
+    n.set_snapshots(per_period_timestamps)
+    n.set_investment_periods([2025, 2030])
+
+    # 5 yr × 8760 h/yr / 48 snapshots = 912.5 h per snapshot
+    n.snapshot_weightings.loc[:, :] = 912.5
+    n.investment_period_weightings["years"] = 5.0
+    n.investment_period_weightings["objective"] = 1.0
+
+    sns = n.snapshots  # MultiIndex (period, timestep)
 
     # ------------------------------------------------------------------
     # Bus
@@ -121,25 +132,19 @@ def build_network(
     n.add("Bus", "grid", carrier="AC")
 
     # ------------------------------------------------------------------
-    # Load — fixed, identical across all snapshots
+    # Load — flat 100 MW
     # ------------------------------------------------------------------
-    n.add(
-        "Load",
-        "demand",
-        bus="grid",
-        p_set=pd.Series(100.0, index=snapshots),   # 100 MW flat load
-    )
+    n.add("Load", "demand", bus="grid", p_set=pd.Series(100.0, index=sns))
 
     # ------------------------------------------------------------------
-    # Solar generator — extendable, zero marginal cost
-    # Period 1 (2025): high capacity factor (0.60) — surplus scenario
-    # Period 2 (2030): low capacity factor  (0.20) — deficit scenario
+    # Solar — extendable, daytime only
+    # Period 2025: CF = 1.2 daytime  (surplus scenario)
+    # Period 2030: CF = 0.3 daytime  (deficit scenario)
     # ------------------------------------------------------------------
-    solar_cf = pd.Series(
-        [0.60, 0.60, 0.60, 0.60,   # 2025 quarters
-         0.20, 0.20, 0.20, 0.20],  # 2030 quarters
-        index=snapshots,
-    )
+    cf = pd.Series(index=sns, dtype=float)
+    cf.loc[2025] = np.where(daytime, 1.2, 0.0)
+    cf.loc[2030] = np.where(daytime, 0.3, 0.0)
+
     n.add(
         "Generator",
         "solar",
@@ -147,16 +152,14 @@ def build_network(
         carrier="solar",
         p_nom_extendable=True,
         p_nom_min=0.0,
-        p_nom_max=1000.0,           # MW
-        capital_cost=60_000.0,      # £/MW (annualised over period)
-        marginal_cost=0.0,          # £/MWh
-        p_max_pu=solar_cf,
-        p_min_pu=pd.Series(0.0, index=snapshots),
-        efficiency=1.0,
+        p_nom_max=500.0,        # MW
+        capital_cost=60_000.0,  # £/MW
+        marginal_cost=0.0,
+        p_max_pu=cf,
     )
 
     # ------------------------------------------------------------------
-    # Gas generator — extendable, expensive peaker
+    # Gas — extendable, expensive peaker, zero capital cost
     # ------------------------------------------------------------------
     n.add(
         "Generator",
@@ -165,79 +168,72 @@ def build_network(
         carrier="gas",
         p_nom_extendable=True,
         p_nom_min=0.0,
-        p_nom_max=500.0,            # MW
-        capital_cost=80_000.0,      # £/MW
-        marginal_cost=150.0,        # £/MWh
-        p_max_pu=pd.Series(1.0, index=snapshots),
-        p_min_pu=pd.Series(0.0, index=snapshots),
-        efficiency=0.45,
+        p_nom_max=500.0,        # MW
+        capital_cost=0.0,
+        marginal_cost=200.0,    # £/MWh
     )
 
     # ------------------------------------------------------------------
-    # StorageUnit — extendable 4-hour battery
+    # Battery — extendable 6-hour storage
+    # state_of_charge_initial: absolute MWh, NOT a fraction of p_nom_opt
     # ------------------------------------------------------------------
     n.add(
         "StorageUnit",
         "battery",
         bus="grid",
         carrier="battery",
-        # capacity
         p_nom_extendable=True,
         p_nom_min=0.0,
-        p_nom_max=500.0,            # MW power capacity
-        max_hours=4.0,              # energy capacity = 4 × p_nom MWh
-        # costs
-        capital_cost=50_000.0,      # £/MW
-        marginal_cost=0.0,          # £/MWh
-        # efficiencies
+        p_nom_max=300.0,        # MW power capacity
+        max_hours=6.0,          # e_nom = 6 × p_nom MWh
+        capital_cost=25.0,      # £/MW
+        marginal_cost=0.0,
         efficiency_store=0.95,
         efficiency_dispatch=0.95,
-        standing_loss=0.001,        # 0.1 % per hour
-        # cycling flags — varied between runs
+        standing_loss=0.0,
+        # Cycling flags — the only difference between runs
         cyclic_state_of_charge=cyclic,
         cyclic_state_of_charge_per_period=cyclic_per_period,
         state_of_charge_initial_per_period=soc_initial_per_period,
-        state_of_charge_initial=soc_initial_mwh,   # MWh (absolute)
+        state_of_charge_initial=soc_initial_mwh,  # MWh absolute
     )
 
     return n
 
 
 # ---------------------------------------------------------------------------
-# Run a network and collect results
+# Run optimisation
 # ---------------------------------------------------------------------------
 
 def run(n: pypsa.Network, label: str, warning_store: list[str]) -> dict:
-    """Optimise network, capture warnings, return results dict."""
-
-    # Attach warning capture handler
+    """Optimise, capture warnings, return results dict."""
     pypsa_logger = logging.getLogger("pypsa")
     handler = _WarningCapture(warning_store)
     pypsa_logger.addHandler(handler)
+    pypsa_logger.setLevel(logging.WARNING)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("always")
-        status, condition = n.optimize(
-            solver_name="highs",
-            multi_investment_periods=True,
-        )
+    status, condition = n.optimize(
+        solver_name="highs",
+        multi_investment_periods=True,
+    )
 
     pypsa_logger.removeHandler(handler)
 
     if status != "ok":
-        raise RuntimeError(f"Run {label}: solver returned status={status}, condition={condition}")
+        raise RuntimeError(
+            f"Run {label}: solver status={status}, condition={condition}"
+        )
 
     su = n.storage_units
-    su_t = n.storage_units_t
+    soc = n.storage_units_t.state_of_charge["battery"]
+    sns = n.snapshots
 
-    # Identify period boundary snapshot indices
-    # Period 2 starts at the 5th snapshot (index 4)
-    period1_last = n.snapshots[3]
-    period2_first = n.snapshots[4]
+    period1_sns = sns[sns.get_level_values(0) == 2025]
+    period2_sns = sns[sns.get_level_values(0) == 2030]
+    period1_last = period1_sns[-1]
+    period2_first = period2_sns[0]
 
-    soc = su_t.state_of_charge["battery"]
-
-    results = {
+    return {
         "label": label,
         "warnings": list(warning_store),
         "p_nom_opt_mw": float(su.loc["battery", "p_nom_opt"]),
@@ -247,11 +243,12 @@ def run(n: pypsa.Network, label: str, warning_store: list[str]) -> dict:
         "objective": float(n.objective),
         "soc_period1_last_mwh": float(soc.loc[period1_last]),
         "soc_period2_first_mwh": float(soc.loc[period2_first]),
-        "soc_trajectory": soc.round(3).to_dict(),
         "period1_last_snapshot": str(period1_last),
         "period2_first_snapshot": str(period2_first),
+        "soc_trajectory": {
+            str(k): round(float(v), 3) for k, v in soc.items()
+        },
     }
-    return results
 
 
 # ---------------------------------------------------------------------------
@@ -259,65 +256,93 @@ def run(n: pypsa.Network, label: str, warning_store: list[str]) -> dict:
 # ---------------------------------------------------------------------------
 
 def print_results(r: dict) -> None:
-    label = r["label"]
-    sep = "=" * 60
+    sep = "=" * 64
     print(f"\n{sep}")
-    print(f"  RUN {label}")
+    print(f"  RUN {r['label']}")
     print(sep)
 
-    print("\n--- Warnings emitted ---")
-    if r["warnings"]:
-        for w in r["warnings"]:
+    print("\n--- Warnings emitted during optimisation ---")
+    pypsa_warnings = [
+        w for w in r["warnings"]
+        if "StorageUnit" in w or "cyclic" in w.lower() or "initial" in w.lower()
+    ]
+    if pypsa_warnings:
+        for w in pypsa_warnings:
             print(f"  WARNING: {w}")
     else:
-        print("  (none)")
+        print("  (none relevant to cycling flags)")
 
-    print("\n--- Period boundary SOC ---")
-    print(f"  Last snapshot of period 1  ({r['period1_last_snapshot']}): "
-          f"{r['soc_period1_last_mwh']:.2f} MWh")
-    print(f"  First snapshot of period 2 ({r['period2_first_snapshot']}): "
-          f"{r['soc_period2_first_mwh']:.2f} MWh")
+    print("\n--- SOC at period boundary ---")
+    print(
+        f"  Last snapshot of period 1  {r['period1_last_snapshot']}: "
+        f"{r['soc_period1_last_mwh']:.3f} MWh"
+    )
+    print(
+        f"  First snapshot of period 2 {r['period2_first_snapshot']}: "
+        f"{r['soc_period2_first_mwh']:.3f} MWh"
+    )
+    print(
+        "  NOTE: SOC at period-2 first snapshot is NOT necessarily equal to "
+        "period-1 last snapshot.\n"
+        "  With CP=True, period-2's first snapshot links back to period-2's "
+        "own last snapshot\n"
+        "  (within-period wrap via roll_within_periods), not to period 1."
+    )
 
     print("\n--- Optimised capacities ---")
-    print(f"  Battery p_nom_opt : {r['p_nom_opt_mw']:.2f} MW")
-    print(f"  Battery e_nom_opt : {r['e_nom_opt_mwh']:.2f} MWh")
-    print(f"  Solar   p_nom_opt : {r['solar_p_nom_opt_mw']:.2f} MW")
-    print(f"  Gas     p_nom_opt : {r['gas_p_nom_opt_mw']:.2f} MW")
+    print(f"  Battery  p_nom_opt : {r['p_nom_opt_mw']:.2f} MW")
+    print(f"  Battery  e_nom_opt : {r['e_nom_opt_mwh']:.2f} MWh")
+    print(
+        f"  NOTE: state_of_charge_initial=50 MWh is an absolute energy value, "
+        f"not a fraction of {r['p_nom_opt_mw']:.1f} MW p_nom_opt."
+    )
+    print(f"  Solar    p_nom_opt : {r['solar_p_nom_opt_mw']:.2f} MW")
+    print(f"  Gas      p_nom_opt : {r['gas_p_nom_opt_mw']:.2f} MW")
 
-    print("\n--- Objective (total system cost) ---")
-    print(f"  £{r['objective']:,.0f}")
+    print("\n--- Total system cost (objective) ---")
+    print(f"  {r['objective']:,.2f}")
 
-    print("\n--- Full SOC trajectory (MWh) ---")
-    for ts, val in r["soc_trajectory"].items():
+    print("\n--- SOC trajectory — period 1 (first and last 3 snapshots) ---")
+    items = [(k, v) for k, v in r["soc_trajectory"].items() if "2025" in k]
+    for ts, val in items[:3]:
+        print(f"  {ts}  {val:.3f} MWh")
+    print("  ...")
+    for ts, val in items[-3:]:
+        print(f"  {ts}  {val:.3f} MWh")
+
+    print("\n--- SOC trajectory — period 2 (first and last 3 snapshots) ---")
+    items2 = [(k, v) for k, v in r["soc_trajectory"].items() if "2030" in k]
+    for ts, val in items2[:3]:
+        print(f"  {ts}  {val:.3f} MWh")
+    print("  ...")
+    for ts, val in items2[-3:]:
         print(f"  {ts}  {val:.3f} MWh")
 
 
 # ---------------------------------------------------------------------------
-# Compare runs
+# Compare
 # ---------------------------------------------------------------------------
 
 def compare(a: dict, b: dict) -> None:
-    print("\n" + "=" * 60)
-    print("  COMPARISON  (Run A vs Run B)")
-    print("=" * 60)
-    print(f"  {'Metric':<35} {'Run A':>12} {'Run B':>12}")
-    print(f"  {'-'*35} {'-'*12} {'-'*12}")
-
-    metrics = [
-        ("Battery p_nom_opt (MW)",     "p_nom_opt_mw"),
-        ("Battery e_nom_opt (MWh)",    "e_nom_opt_mwh"),
-        ("Solar p_nom_opt (MW)",       "solar_p_nom_opt_mw"),
-        ("Gas p_nom_opt (MW)",         "gas_p_nom_opt_mw"),
-        ("SOC period-1 last (MWh)",    "soc_period1_last_mwh"),
-        ("SOC period-2 first (MWh)",   "soc_period2_first_mwh"),
-        ("Objective £",                "objective"),
+    print("\n" + "=" * 64)
+    print("  COMPARISON  Run A (C only)  vs  Run B (CP + IP)")
+    print("=" * 64)
+    print(f"  {'Metric':<40} {'Run A':>10} {'Run B':>10}")
+    print(f"  {'-'*40} {'-'*10} {'-'*10}")
+    rows = [
+        ("Battery p_nom_opt (MW)",   "p_nom_opt_mw"),
+        ("Battery e_nom_opt (MWh)",  "e_nom_opt_mwh"),
+        ("Solar p_nom_opt (MW)",     "solar_p_nom_opt_mw"),
+        ("Gas p_nom_opt (MW)",       "gas_p_nom_opt_mw"),
+        ("SOC period-1 last (MWh)",  "soc_period1_last_mwh"),
+        ("SOC period-2 first (MWh)", "soc_period2_first_mwh"),
+        ("Objective",                "objective"),
     ]
-    for name, key in metrics:
+    for name, key in rows:
         va, vb = a[key], b[key]
-        print(f"  {name:<35} {va:>12.2f} {vb:>12.2f}")
-
-    print("\n  Warnings Run A:", len(a["warnings"]))
-    print("  Warnings Run B:", len(b["warnings"]))
+        print(f"  {name:<40} {va:>10.2f} {vb:>10.2f}")
+    print(f"\n  Cycling-related warnings Run A : {len([w for w in a['warnings'] if 'StorageUnit' in w or 'cyclic' in w.lower()])}")
+    print(f"  Cycling-related warnings Run B : {len([w for w in b['warnings'] if 'StorageUnit' in w or 'cyclic' in w.lower()])}")
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +351,7 @@ def compare(a: dict, b: dict) -> None:
 
 if __name__ == "__main__":
 
-    print("\nBuilding Run A — global cycling only (C=True, CP=False, IP=False)")
+    print("\nRun A — global cycling only (C=True, CP=False, IP=False)")
     n_a = build_network(
         cyclic=True,
         cyclic_per_period=False,
@@ -336,12 +361,15 @@ if __name__ == "__main__":
     results_a = run(n_a, "A", captured_warnings["A"])
     print_results(results_a)
 
-    print("\nBuilding Run B — per-period cycling (C=False, CP=True, IP=True, soc_initial=50 MWh)")
+    print(
+        "\nRun B — per-period cycling "
+        "(C=False, CP=True, IP=True, soc_initial=50 MWh absolute)"
+    )
     n_b = build_network(
         cyclic=False,
         cyclic_per_period=True,
         soc_initial_per_period=True,
-        soc_initial_mwh=50.0,   # 50 MWh absolute — NOT a fraction of p_nom
+        soc_initial_mwh=50.0,   # 50 MWh absolute — NOT a fraction of p_nom_opt
     )
     results_b = run(n_b, "B", captured_warnings["B"])
     print_results(results_b)
