@@ -1,5 +1,24 @@
 # Engineering Terminal Benchmark — REVISED Submission (v2)
 
+> ⚠️ **UNDER REVISION — SUPERSEDED IN PART (2026-09-19).** Reviewer (Francisco)
+> and subsequent verification found two errors in this document, and it should NOT
+> be read as final:
+>
+> 1. **Q3 is WRONG.** It claims configs B (IP-only) and D (CP+IP) produce an
+>    identical period-2 first LP row. On the pinned commit `cfaab2f` they do NOT —
+>    B drops the predecessor (RHS −50); D keeps it and wraps to period-2's last
+>    snapshot (RHS 0), because `include_previous_soc_pp = active & (within_period |
+>    CP)` is True for D. The original "B=D" diagnostic was mistakenly run on PyPSA
+>    **1.3.0**, whose mask (`periods == periods.shift`) ignores CP — a different
+>    code path from `cfaab2f`.
+> 2. **The closed-book AI check below is a PLACEHOLDER prediction, not a real run.**
+>    Real GPT-5.6 and Claude Opus transcripts are pending.
+>
+> Additionally, `cfaab2f` could not be built/solved in any reconstructable
+> dependency environment, so LP-row claims must be verified via isolated mask
+> arithmetic, not a solve. A re-pin decision (stay on `cfaab2f` vs move to a
+> runnable release) is pending with the reviewer. See `REVIEWER_CORRECTION.md`.
+
 **Addresses reviewer feedback:** Q1–Q3 reworked around a mechanism the code does
 NOT narrate; Q4 retained as anchor; closed-book AI check re-run against the actual
 four questions (below), not a paraphrase.
@@ -87,7 +106,8 @@ Answer all four:
    opposite of what "reset to initial value" might naively suggest (adding a
    constraint, not removing a predecessor)?
 
-3. Configurations **B and D** produce an identical period-2 first LP row (no
+3. **⚠️ THIS QUESTION IS WRONG — its premise is false; see banner at top.**
+   Configurations **B and D** produce an identical period-2 first LP row (no
    predecessor term, RHS −50) yet different solved period-2 trajectories. Explain,
    from the code, why B and D share the *same boundary row* despite CP differing —
    i.e. why the boundary-row construction does not distinguish IP-only from CP+IP,
