@@ -1,5 +1,16 @@
 # Engineering Terminal Benchmark — Submission
 
+> ⛔ **SUPERSEDED / WITHDRAWN (2026-09-20).** This original submission is retained
+> only as a record. It was found to have significant problems: (1) the CP/IP
+> precedence it centres on is stated verbatim in the pinned commit's docstring
+> (tests comment-reading, not tracing); (2) the pinned commit `cfaab2f` does not
+> build/solve in any reconstructable environment; (3) later diagnostics attributed
+> to `cfaab2f` were mistakenly run on PyPSA 1.3.0, whose code path differs. The
+> benchmark direction has been withdrawn. See `REVIEWER_CORRECTION.md` and the
+> banner in `SUBMISSION_v2.md`. Do not treat anything below as valid.
+
+
+
 **Participant:** Gift Udoh
 **Date:** 17/09/2026
 **Repository:** https://github.com/PyPSA/PyPSA (MIT-licensed)

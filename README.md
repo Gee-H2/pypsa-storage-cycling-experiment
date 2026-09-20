@@ -1,5 +1,15 @@
 # PyPSA StorageUnit CP vs C Cycling Experiment
 
+> ⛔ **STATUS: WITHDRAWN (2026-09-20).** This experiment was a benchmark-question
+> attempt that did not clear review. Key issues: the mechanism it studies is
+> documented in the pinned commit; the pinned commit `cfaab2f` is not runnable in a
+> clean environment; and the runnable experiments here execute on PyPSA **1.3.0**,
+> whose SOC-boundary mask DIFFERS from `cfaab2f` (on 1.3.0 configs B and D coincide;
+> on `cfaab2f` they diverge). Results below should be read with that caveat. See
+> `REVIEWER_CORRECTION.md` for the full account.
+
+
+
 **Commit pinned:** [`cfaab2f`](https://github.com/PyPSA/PyPSA/blob/cfaab2fd723d14fd6ad3594bdca8c0c1c9d4a14d/pypsa/optimization/constraints.py) (master, 2026-09-16)
 **Function under study:** [`define_storage_unit_constraints`](https://github.com/PyPSA/PyPSA/blob/cfaab2fd723d14fd6ad3594bdca8c0c1c9d4a14d/pypsa/optimization/constraints.py)
 
