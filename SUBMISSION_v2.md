@@ -1,6 +1,9 @@
 # Engineering Terminal Benchmark — REVISED Submission (v2)
 
-> ⚠️ **UNDER REVISION — SUPERSEDED IN PART (2026-09-19).** Reviewer (Francisco)
+> ⛔ **WITHDRAWN / CLOSED (2026-09-20).** Per the reviewer's decision, this
+> benchmark direction is closed: both frontier models answered the required facts
+> closed-book (see Closed-book check section), and the pinned cfaab2f commit is
+> non-runnable. Retained only as an honest record. Reviewer (Francisco)
 > and subsequent verification found two errors in this document, and it should NOT
 > be read as final:
 >
@@ -183,29 +186,54 @@ standing-efficiency/period-weighting handling, not a hard fix.
 
 ---
 
-## Closed-book AI check — TO RUN before resending
+## Closed-book AI check — RESULTS (real runs) + CLOSE-OUT
 
-The reviewer asked for the closed-book check to be run against **the actual four
-questions above**, verbatim, not a paraphrase. This must be done by pasting Q1–Q4
-exactly as written into a model with no repository access / no browsing, and
-recording its verbatim response here.
+Two frontier models were given the four questions verbatim, closed-book (no
+repository access, no browsing). Both answered the required facts correctly. Per
+the reviewer's decision, this confirms the questions do not require repo-specific
+tracing, and **this benchmark direction is closed** (see below).
 
-**HONESTY NOTE (do not delete):** I have not fabricated a model transcript. The
-text below is a *prediction* of the likely failure mode, clearly labelled as such;
-replace it with the real recorded response before sending to the reviewer.
+**Model 1 — GPT-5.6 (closed-book).** Answered all four correctly, explicitly
+noting it reasoned "from my knowledge of the `define_storage_unit_constraints`
+implementation pattern rather than looking at a particular PyPSA release." It
+correctly derived: the flattened (period, timestep) snapshot axis giving
+`prev(2030,t1) = (2025,tN)` for the non-cyclic case (Q1); the `per_period = CP | IP`
+union and the substitution of the variable predecessor by `soc_init` in the RHS
+(Q2); and the capacity-vs-adequacy economic argument for Q4. On Q3 it asserted B
+and D differ via "future shadow value of SOC" — plausible but, as it turned out,
+not the controlling factor (see note).
 
-**Prompt to use (verbatim):** paste the four numbered questions from "Revised
-Question" above, prefixed with: *"Using PyPSA's multi-investment-period StorageUnit
-energy-balance code, answer the following without accessing the repository:"*
+**Model 2 — Claude Opus (closed-book).** Answered all four correctly and more
+rigorously, reconstructing the mask logic from memory. Critically, on Q3 it
+**pushed back on the premise**: with C=False, CP is read only in
+`per_period = CP | IP`, so "once IP is on, CP cannot change any coefficient in any
+energy-balance row of this unit" — and it correctly diagnosed the 48-vs-50
+difference as solver degeneracy, prescribing the exact diagnostic (compare
+objectives; add a tie-breaker marginal cost). This was later confirmed on PyPSA
+1.3.0. **Note the version subtlety it exposed:** Claude's "CP changes nothing"
+reasoning is correct for the **1.3.0** mask (`periods == periods.shift`), whereas
+on the pinned **cfaab2f** mask (`within_period | CP`) CP *does* enter and B/D
+diverge. The models were reasoning against the general/1.3.0 pattern, not cfaab2f.
 
-**Predicted failure mode (to be replaced with the actual run):** a closed-book
-model is likely to assert that a "non-cyclic" unit resets or starts empty at each
-period (Wrong Conclusion A), because "non-cyclic + multi-period" intuitively reads
-as "independent periods." It is unlikely to identify the forward-fill `roll` that
-carries SOC across the boundary, since that behaviour is not documented and is
-counterintuitive. This is precisely why Q1 tests code tracing rather than
-comment-reading — but it MUST be confirmed with a real closed-book run, not this
-prediction.
+**Outcome.** Both frontier models cleared Q1, Q2, Q4 closed-book. Q3 as originally
+written was additionally found to be premised on a 1.3.0 result mis-attributed to
+cfaab2f. Per the reviewer's guidance:
 
-**Action:** run the four questions against the sealed model, paste the verbatim
-answer here, and mark which of the four it gets right/wrong.
+> "If the model gets the required facts, drop it. I would still rather you leave
+> this function. A different seam or a different repo will cost you less than
+> another round here."
+
+**This benchmark (the StorageUnit CP/IP/non-cyclic mechanism, pinned to cfaab2f)
+is withdrawn.** Reasons, on the record:
+1. The precedence rule (CP over IP) is stated verbatim in the docstring and inline
+   comment — comment-reading, not tracing.
+2. The reworked cross-period-carry framing (Q1/Q2) is answerable by frontier
+   models from pattern knowledge, closed-book.
+3. Q3's "B≠D" is the docstring's "CP takes precedence" line implemented as a
+   boolean short-circuit — not a new finding.
+4. The pinned commit `cfaab2f` does not build or solve in any reconstructable
+   dependency environment, so "run it and see" is not possible.
+
+Q4 (per-period cycling → more firm capacity) was the only genuinely
+tracing-resistant part, but on its own it is an optimisation-economics question,
+not a code-tracing one. No further work will be built on this function.
